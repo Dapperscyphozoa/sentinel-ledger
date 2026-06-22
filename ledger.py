@@ -59,6 +59,7 @@ def _init_db() -> None:
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts          REAL    NOT NULL,           -- unix epoch float
                 session_id  TEXT,
+                provider    TEXT,                       -- e.g. nvidia, groq, cerebras
                 model       TEXT,
                 prompt_hash TEXT,                       -- sha256[:16] of prompt
                 verdict     TEXT    NOT NULL,           -- CLEAN | MINOR | MAJOR | BLOCK
@@ -68,8 +69,14 @@ def _init_db() -> None:
                 notes       TEXT
             )
         """)
-        con.execute("CREATE INDEX IF NOT EXISTS idx_verdict ON records(verdict)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_ts     ON records(ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_verdict  ON records(verdict)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_ts       ON records(ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_provider ON records(provider)")
+        # Forward-compat migration: add provider column to existing databases
+        try:
+            con.execute("ALTER TABLE records ADD COLUMN provider TEXT")
+        except Exception:
+            pass  # column already exists
 
 
 @contextmanager
@@ -93,6 +100,7 @@ VALID_VERDICTS = {"CLEAN", "MINOR", "MAJOR", "BLOCK"}
 class RecordIn(BaseModel):
     verdict: str                              = Field(..., description="CLEAN | MINOR | MAJOR | BLOCK")
     session_id: Optional[str]                 = None
+    provider: Optional[str]                   = None
     model: Optional[str]                      = None
     prompt_hash: Optional[str]                = None
     latency_ms: Optional[float]               = None
@@ -106,6 +114,7 @@ class RecordOut(BaseModel):
     ts: float
     verdict: str
     session_id: Optional[str]
+    provider: Optional[str]
     model: Optional[str]
     latency_ms: Optional[float]
 
@@ -116,6 +125,7 @@ class StatsOut(BaseModel):
     avg_latency_ms: Optional[float]
     p95_latency_ms: Optional[float]
     top_models: list[dict]
+    top_providers: list[dict]
     window_24h: dict[str, int]
 
 
@@ -146,12 +156,13 @@ def record(body: RecordIn) -> RecordOut:
     with _conn() as con:
         cur = con.execute(
             """INSERT INTO records
-               (ts, session_id, model, prompt_hash, verdict,
+               (ts, session_id, provider, model, prompt_hash, verdict,
                 latency_ms, tokens_in, tokens_out, notes)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 now,
                 body.session_id,
+                body.provider,
                 body.model,
                 body.prompt_hash,
                 verdict,
@@ -168,6 +179,7 @@ def record(body: RecordIn) -> RecordOut:
         ts=now,
         verdict=verdict,
         session_id=body.session_id,
+        provider=body.provider,
         model=body.model,
         latency_ms=body.latency_ms,
     )
@@ -203,6 +215,13 @@ def stats() -> StatsOut:
         ).fetchall()
         top_models = [{"model": r["model"], "count": r["n"]} for r in top_model_rows]
 
+        top_provider_rows = con.execute(
+            """SELECT provider, COUNT(*) AS n FROM records
+               WHERE provider IS NOT NULL
+               GROUP BY provider ORDER BY n DESC LIMIT 10"""
+        ).fetchall()
+        top_providers = [{"provider": r["provider"], "count": r["n"]} for r in top_provider_rows]
+
         cutoff_24h = time.time() - 86400
         w24_rows = con.execute(
             "SELECT verdict, COUNT(*) AS n FROM records WHERE ts >= ? GROUP BY verdict",
@@ -216,5 +235,6 @@ def stats() -> StatsOut:
         avg_latency_ms=round(avg_lat, 2) if avg_lat is not None else None,
         p95_latency_ms=round(p95_lat, 2) if p95_lat is not None else None,
         top_models=top_models,
+        top_providers=top_providers,
         window_24h=window_24h,
     )

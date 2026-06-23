@@ -7,6 +7,7 @@ DB:   SQLite at LEDGER_DB_PATH (default: ./ledger.db)
 
 Endpoints:
   POST /record   — append a council verdict record
+  GET  /records  — recent records (router graph-ledger feed)
   GET  /stats    — aggregated verdict counts + latency stats
   GET  /health   — liveness probe
 
@@ -63,6 +64,7 @@ def _init_db() -> None:
                 model       TEXT,
                 prompt_hash TEXT,                       -- sha256[:16] of prompt
                 verdict     TEXT    NOT NULL,           -- CLEAN | MINOR | MAJOR | BLOCK
+                confidence  REAL,                       -- 0.0..1.0 audit confidence
                 latency_ms  REAL,
                 tokens_in   INTEGER,
                 tokens_out  INTEGER,
@@ -72,11 +74,15 @@ def _init_db() -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_verdict  ON records(verdict)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_ts       ON records(ts)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_provider ON records(provider)")
-        # Forward-compat migration: add provider column to existing databases
-        try:
-            con.execute("ALTER TABLE records ADD COLUMN provider TEXT")
-        except Exception:
-            pass  # column already exists
+        # Forward-compat migrations for older databases
+        for col_def in [
+            "ALTER TABLE records ADD COLUMN provider TEXT",
+            "ALTER TABLE records ADD COLUMN confidence REAL",
+        ]:
+            try:
+                con.execute(col_def)
+            except Exception:
+                pass  # column already exists
 
 
 @contextmanager
@@ -103,6 +109,7 @@ class RecordIn(BaseModel):
     provider: Optional[str]                   = None
     model: Optional[str]                      = None
     prompt_hash: Optional[str]                = None
+    confidence: Optional[float]               = None
     latency_ms: Optional[float]               = None
     tokens_in: Optional[int]                  = None
     tokens_out: Optional[int]                 = None
@@ -116,6 +123,7 @@ class RecordOut(BaseModel):
     session_id: Optional[str]
     provider: Optional[str]
     model: Optional[str]
+    confidence: Optional[float]
     latency_ms: Optional[float]
 
 
@@ -157,8 +165,8 @@ def record(body: RecordIn) -> RecordOut:
         cur = con.execute(
             """INSERT INTO records
                (ts, session_id, provider, model, prompt_hash, verdict,
-                latency_ms, tokens_in, tokens_out, notes)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                confidence, latency_ms, tokens_in, tokens_out, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 now,
                 body.session_id,
@@ -166,6 +174,7 @@ def record(body: RecordIn) -> RecordOut:
                 body.model,
                 body.prompt_hash,
                 verdict,
+                body.confidence,
                 body.latency_ms,
                 body.tokens_in,
                 body.tokens_out,
@@ -181,8 +190,47 @@ def record(body: RecordIn) -> RecordOut:
         session_id=body.session_id,
         provider=body.provider,
         model=body.model,
+        confidence=body.confidence,
         latency_ms=body.latency_ms,
     )
+
+
+@app.get("/records", dependencies=[Depends(_check_token)])
+def records(limit: int = 200, provider: Optional[str] = None) -> list:
+    """Return recent records for the router graph-ledger feed.
+
+    Each entry includes provider, model, verdict, confidence, ts.
+    Capped at 1000 to avoid runaway responses.
+    """
+    limit = min(max(1, limit), 1000)
+    with _conn() as con:
+        if provider:
+            rows = con.execute(
+                """SELECT id, ts, provider, model, verdict, confidence, latency_ms
+                   FROM records
+                   WHERE provider = ?
+                   ORDER BY ts DESC LIMIT ?""",
+                (provider, limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """SELECT id, ts, provider, model, verdict, confidence, latency_ms
+                   FROM records
+                   ORDER BY ts DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "ts": r["ts"],
+            "provider": r["provider"],
+            "model": r["model"],
+            "verdict": r["verdict"],
+            "confidence": r["confidence"],
+            "latency_ms": r["latency_ms"],
+        }
+        for r in rows
+    ]
 
 
 @app.get("/stats", response_model=StatsOut, dependencies=[Depends(_check_token)])
